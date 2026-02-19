@@ -1,0 +1,2 @@
+# RandomPngToDragAndDrop
+设置文件夹后通过调用draganddrop插件的方法来随机载入png文件
