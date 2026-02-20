@@ -13,6 +13,7 @@ set OUT=%GAME%\BepInEx\plugins\KK_dragdrop_random_png.dll
  /r:%GAME%\BepInEx\core\BepInEx.dll ^
  /r:%MANAGED%\UnityEngine.UI.dll ^
  /r:%MANAGED%\Assembly-CSharp.dll ^
+ /r:%GAME%\BepInEx\core\0Harmony.dll ^
  /out:%OUT% ^
  %SRC%
 

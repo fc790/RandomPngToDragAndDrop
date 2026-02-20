@@ -6,12 +6,14 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Collections;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Reflection;
 
 using BepInEx;
 using BepInEx.Configuration;
+using HarmonyLib;
 using UnityEngine;
 
 using Manager;
@@ -23,40 +25,158 @@ namespace FC790s
     public class RandomPngDropViaWM_BatchFemale : BaseUnityPlugin
     {
         public const string GUID = "fc790s.dragdrop_random_png_wmdrop";
-        public const string NAME = "Random PNG Drop via WM_DROPFILES (F8 + Batch Female)";
-        public const string VER  = "1.2.0";
+        public const string NAME = "Random PNG Drop via WM_DROPFILES (F4/Ctrl+F4 + AutoTriggers)";
+        public const string VER  = "1.3.0";
 
         private ConfigEntry<bool> _enable;
-        private ConfigEntry<string> _pngDir;
+
+        // Two directory paths:
+        // - F4 uses PngDir_F4
+        // - Ctrl+F4 uses PngDir_CtrlF4
+        private ConfigEntry<string> _pngDir_F4;
+        private ConfigEntry<string> _pngDir_CtrlF4;
 
         private ConfigEntry<bool> _batchReplaceAllFemale;
         private ConfigEntry<bool> _preselectAllFemale;
         private ConfigEntry<bool> _perCharacterRandom;
 
+        // ===== Auto triggers (migrated from AffectedDynamicBonesEnabledPersistForKKS.cs) =====
+        private ConfigEntry<bool> _autoOnCharacterReplace;
+        private ConfigEntry<bool> _autoOnSceneLoad;
+        private ConfigEntry<int>  _autoDelayFrames; // delay frames before auto action
+        private ConfigEntry<bool> _patchTriggers;   // master switch for Harmony patches
+
+        // Harmony PatchAny via reflection (avoid overload assumptions)
+        private Harmony _harmony;
+        private static MethodInfo _miHarmonyPatchAny;
+
+        private static bool _isInternalTrigger = false; // 内部触发锁
+
         private System.Random _rng = new System.Random();
 
         private bool _busy = false;
+        // reflect
+        private static bool S_RefOk = false;
+        private static Type T_MainWindow;
 
-        private void Awake()
+        private static RandomPngDropViaWM_BatchFemale _inst;
+private void Awake()
         {
-            _enable = Config.Bind<bool>("General", "Enable", true, "Master switch.");
-            _pngDir = Config.Bind<string>("General", "PngDir", "", "Directory to scan for *.png (absolute path recommended).");
+            _inst = this;
 
-            _batchReplaceAllFemale = Config.Bind<bool>("Batch", "BatchReplaceFemale", false, "If true, F8 will iterate all female characters and replace each one by dropping a random PNG while selecting that character.");
-            _preselectAllFemale    = Config.Bind<bool>("Batch", "PreselectAllFemale", false, "If true, F8 will first set selection to all female characters (selection highlight / consistency).");
+            _enable = Config.Bind<bool>("General", "Enable", true, "Master switch.");
+
+            _pngDir_F4      = Config.Bind<string>("General", "PngDir_F4", "", "Directory to scan for *.png (F4). Absolute path recommended.");
+            _pngDir_CtrlF4  = Config.Bind<string>("General", "PngDir_CtrlF4", "", "Directory to scan for *.png (Ctrl+F4). Absolute path recommended.");
+
+            _batchReplaceAllFemale = Config.Bind<bool>("Batch", "BatchReplaceFemale", false, "If true, hotkey will iterate all female characters and replace each one by dropping a random PNG while selecting that character.");
+            _preselectAllFemale    = Config.Bind<bool>("Batch", "PreselectAllFemale", false, "If true, hotkey will first set selection to all female characters (selection highlight / consistency).");
             _perCharacterRandom    = Config.Bind<bool>("Batch", "PerCharacterRandom", true, "If true, each female gets its own random PNG. If false, all females use the same picked PNG.");
 
-            Logger.LogInfo("Loaded. F8 => drop random png via PostMessage(WM_DROPFILES). Batch options available in config.");
+            // Auto triggers
+            _patchTriggers        = Config.Bind<bool>("AutoTrigger", "PatchTriggers", true, "If true, patch HSPE/Studio triggers (OnCharacterReplace / SceneInfo.Load).");
+            _autoOnCharacterReplace = Config.Bind<bool>("AutoTrigger", "AutoOnCharacterReplace", false, "If true, after character replace, auto-run using F4 directory (PngDir_F4).");
+            _autoOnSceneLoad        = Config.Bind<bool>("AutoTrigger", "AutoOnSceneLoad", false, "If true, after scene load, auto-run using F4 directory (PngDir_F4).");
+            _autoDelayFrames        = Config.Bind<int>("AutoTrigger", "AutoDelayFrames", 30, "Delay frames before auto-run for triggers (0-600).");
+
+            // init harmony patch helper
+            if (_patchTriggers.Value)
+            {
+                TryInitHarmonyPatchAny();
+                TryInitReflection();
+                Patch_MainWindow_OnCharacterReplace();
+                Patch_StudioScene_Load();
+            }
+
+            Logger.LogInfo("Loaded. F4 => drop random PNG from PngDir_F4. Ctrl+F4 => from PngDir_CtrlF4.");
         }
+
 
         private void Update()
         {
             if (!_enable.Value) return;
             if (_busy) return;
 
-            if (Input.GetKeyDown(KeyCode.F8))
+            // F4: use PngDir_F4
+            // Ctrl+F4: use PngDir_CtrlF4
+            if (Input.GetKeyDown(KeyCode.U))
             {
-                StartCoroutine(Co_F8Action());
+                bool ctrl = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
+                string dir = ctrl ? _pngDir_CtrlF4.Value : _pngDir_F4.Value;
+                string tag = ctrl ? "CTRL+F4" : "F4";
+                StartCoroutine(Co_RunFromDir(dir, tag));
+            }
+        }
+
+        private static Type FindType(string fullName)
+        {
+            Type t = Type.GetType(fullName, false);
+            if (t != null) return t;
+
+            Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < asms.Length; i++)
+            {
+                Assembly a = asms[i];
+                if (a == null) continue;
+                try
+                {
+                    t = a.GetType(fullName, false);
+                    if (t != null) return t;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        private void TryInitReflection()
+        {
+            if (S_RefOk) return;
+
+            try
+            {
+                T_MainWindow = FindType("HSPE.MainWindow");
+
+                if (T_MainWindow == null)
+                {
+                    Logger.LogWarning("[REF] missing members.");
+                    return;
+                }
+
+                S_RefOk = true;
+                Logger.LogInfo("[REF] OK");
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[REF] Exception: " + e.Message);
+            }
+        }
+
+        private void Patch_MainWindow_OnCharacterReplace()
+        {
+            if (_miHarmonyPatchAny == null) return;
+
+            try
+            {
+                MethodInfo mi = T_MainWindow.GetMethod("OnCharaLoad", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (mi == null)
+                {
+                    Logger.LogWarning("[PATCH] MainWindow." + "OnCharacterReplace" + " not found (skip).");
+                    return;
+                }
+
+                MethodInfo post = typeof(RandomPngDropViaWM_BatchFemale).GetMethod("MW_OnCharacterReplace_Postfix", BindingFlags.Static | BindingFlags.NonPublic);
+                if (post == null)
+                {
+                    Logger.LogWarning("[PATCH] Postfix not found: " + "MW_OnCharacterReplace_Postfix");
+                    return;
+                }
+
+                PatchPostfix(mi, post, Priority.Last);
+                Logger.LogInfo("[PATCH] Patched MainWindow." + "OnCharacterReplace" + " postfix.");
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[PATCH] Patch_MainWindow_OnCharacterReplace failed: " + e.Message);
             }
         }
         
@@ -314,12 +434,12 @@ namespace FC790s
             }
         }
 
-        private System.Collections.IEnumerator Co_F8Action()
+        private System.Collections.IEnumerator Co_RunFromDir(string dir, string tag)
         {
             _busy = true;
             try
             {
-                string dir = (_pngDir.Value == null) ? "" : _pngDir.Value.Trim();
+                dir = (dir == null) ? "" : dir.Trim();
                 if (dir.Length == 0)
                 {
                     Logger.LogWarning("PngDir is empty.");
@@ -370,13 +490,13 @@ namespace FC790s
                     femaleNodes = GetAllFemaleCharacterNodes();
                     if (femaleNodes.Count == 0)
                     {
-                        Logger.LogWarning("[F8] No female characters found in scene.");
+                        Logger.LogWarning("[HOTKEY] No female characters found in scene.");
                         yield break;
                     }
                 
                     SetSelectedNodes_Compat(femaleNodes.ToArray());
                     yield return null;
-                    Logger.LogInfo("[F8] PreselectAllFemale only. females=" + femaleNodes.Count);
+                    Logger.LogInfo("[HOTKEY] PreselectAllFemale only. females=" + femaleNodes.Count);
                     yield break;
                 }
                 
@@ -386,20 +506,26 @@ namespace FC790s
                     femaleNodes = GetAllFemaleCharacterNodes();
                     if (P)
                     {
+                        if (femaleNodes.Count <= 1)
+                        {
+                            Logger.LogWarning("[HOTKEY] No female characters found in scene.");
+                            yield break;
+                        }
                         SetSelectedNodes_Compat(femaleNodes.ToArray());
                         yield return null;
                     }
 
                     TreeNodeObject[] prevSel = CaptureSelectedNodes();
-                    if (prevSel.Length == 0)
+                    Logger.LogInfo("[HOTKEY] select node=" + prevSel.Length);
+                    if (prevSel.Length <= 1)
                     {
                         string path = pngs[_rng.Next(0, pngs.Length)];
-                        Logger.LogInfo("[F8] no selected ,but drop one (no preselect). png=" + path);
+                        Logger.LogInfo("[HOTKEY] no selected ,but drop one (no preselect). png=" + path);
                         PostOneDrop(hUnity, path);
                         yield break;
                     }
                 
-                    Logger.LogInfo("[F8] PerCharacterRandom batch. females=" + femaleNodes.Count);
+                    Logger.LogInfo("[HOTKEY] PerCharacterRandom batch. females=" + femaleNodes.Count);
                 
                     for (int i = 0; i < prevSel.Length; i++)
                     {
@@ -411,14 +537,14 @@ namespace FC790s
                         yield return null;
                 
                         string usePath = pngs[_rng.Next(0, pngs.Length)];
-                        Logger.LogInfo("[F8] PerChar drop idx=" + i + " png=" + usePath);
+                        Logger.LogInfo("[HOTKEY] PerChar drop idx=" + i + " png=" + usePath);
                         PostOneDrop(hUnity, usePath);
                 
                         yield return null;
                     }
-                
                     SetSelectedNodes_Compat(prevSel);
-                    Logger.LogInfo("[F8] PerCharacterRandom done. females=" + femaleNodes.Count);
+
+                    Logger.LogInfo("[HOTKEY] PerCharacterRandom done. females=" + femaleNodes.Count);
                     yield break;
                 }
                 
@@ -430,7 +556,7 @@ namespace FC790s
                         femaleNodes = GetAllFemaleCharacterNodes();
                         if (femaleNodes.Count == 0)
                         {
-                            Logger.LogWarning("[F8] No female characters found in scene.");
+                            Logger.LogWarning("[HOTKEY] No female characters found in scene.");
                             yield break;
                         }
                 
@@ -439,7 +565,7 @@ namespace FC790s
                         yield return null;
                 
                         string path = pngs[_rng.Next(0, pngs.Length)];
-                        Logger.LogInfo("[F8] Batch single drop after preselect. png=" + path);
+                        Logger.LogInfo("[HOTKEY] Batch single drop after preselect. png=" + path);
                         PostOneDrop(hUnity, path);
                 
                         // 你如果希望 batch drop 后保持全选，就注释掉下一行
@@ -450,7 +576,7 @@ namespace FC790s
                     else
                     {
                         string path = pngs[_rng.Next(0, pngs.Length)];
-                        Logger.LogInfo("[F8] Batch single drop (no preselect). png=" + path);
+                        Logger.LogInfo("[HOTKEY] Batch single drop (no preselect). png=" + path);
                         PostOneDrop(hUnity, path);
                         yield break;
                     }
@@ -459,7 +585,7 @@ namespace FC790s
                 // 其它：普通单次随机 drop
                 {
                     string path = pngs[_rng.Next(0, pngs.Length)];
-                    Logger.LogInfo("[F8] Single drop. png=" + path);
+                    Logger.LogInfo("[HOTKEY] Single drop. png=" + path);
                     PostOneDrop(hUnity, path);
                     yield break;
                 }
@@ -469,6 +595,280 @@ namespace FC790s
                 _busy = false;
             }
         }
+        // =========================================================
+        // Migrated trigger hooks (from AffectedDynamicBonesEnabledPersistForKKS.cs)
+        // - Character replace: HSPE.MainWindow.OnCharacterReplace postfix
+        // - Scene load:        Studio.SceneInfo.Load(string, out Version) postfix
+        // =========================================================
+
+        private void TryInitHarmonyPatchAny()
+        {
+            try
+            {
+                if (_harmony == null) _harmony = new Harmony(GUID);
+
+                // Harmony.Patch(...) overload count differs across Harmony versions.
+                // We resolve the instance method "Patch" / "PatchAny" by reflection and call it with a padded args array.
+                if (_miHarmonyPatchAny == null)
+                {
+                    // Prefer method name "Patch", fallback "PatchAny" (some forks)
+                    Type th = typeof(Harmony);
+                    MethodInfo[] ms = th.GetMethods(BindingFlags.Public | BindingFlags.Instance);
+                    for (int i = 0; i < ms.Length; i++)
+                    {
+                        MethodInfo mi = ms[i];
+                        if (mi == null) continue;
+                        string n = mi.Name;
+                        if (n != "Patch" && n != "PatchAny") continue;
+
+                        ParameterInfo[] ps = mi.GetParameters();
+                        if (ps == null || ps.Length < 2) continue;
+
+                        // first param must be MethodBase
+                        if (!typeof(MethodBase).IsAssignableFrom(ps[0].ParameterType)) continue;
+
+                        _miHarmonyPatchAny = mi;
+                        break;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[PATCH] TryInitHarmonyPatchAny failed: " + e.Message);
+            }
+        }
+
+        // ---------------------------------------------------------
+        // Reflection helpers (avoid AccessTools.* because old 0Harmony differs)
+        // ---------------------------------------------------------
+
+        private static Type ReflectGetType(string fullName)
+        {
+            if (string.IsNullOrEmpty(fullName)) return null;
+
+            try
+            {
+                // Try direct Type.GetType first (works if assembly qualified)
+                Type t0 = Type.GetType(fullName, false);
+                if (t0 != null) return t0;
+            }
+            catch { }
+
+            try
+            {
+                Assembly[] asms = AppDomain.CurrentDomain.GetAssemblies();
+                int i;
+                for (i = 0; i < asms.Length; i++)
+                {
+                    Assembly a = asms[i];
+                    if (a == null) continue;
+                    Type t = null;
+                    try { t = a.GetType(fullName, false); }
+                    catch { t = null; }
+                    if (t != null) return t;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        private static bool ParamsMatch(ParameterInfo[] ps, Type[] want)
+        {
+            if (want == null) return true; // any signature
+            if (ps == null) return (want.Length == 0);
+            if (ps.Length != want.Length) return false;
+
+            int i;
+            for (i = 0; i < ps.Length; i++)
+            {
+                Type pt = ps[i].ParameterType;
+                Type wt = want[i];
+
+                if (pt == wt) continue;
+
+                // Handle byref comparison safely
+                if (pt != null && wt != null)
+                {
+                    if (pt.IsByRef && wt.IsByRef)
+                    {
+                        if (pt.GetElementType() == wt.GetElementType()) continue;
+                    }
+                }
+
+                return false;
+            }
+            return true;
+        }
+
+        private static MethodInfo ReflectFindMethod(string typeFullName, string methodName, Type[] paramTypes)
+        {
+            if (string.IsNullOrEmpty(typeFullName) || string.IsNullOrEmpty(methodName)) return null;
+
+            Type t = ReflectGetType(typeFullName);
+            if (t == null) return null;
+
+            BindingFlags bf = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+            try
+            {
+                MethodInfo[] ms = t.GetMethods(bf);
+                int i;
+                for (i = 0; i < ms.Length; i++)
+                {
+                    MethodInfo mi = ms[i];
+                    if (mi == null) continue;
+                    if (mi.Name != methodName) continue;
+
+                    ParameterInfo[] ps = null;
+                    try { ps = mi.GetParameters(); } catch { ps = null; }
+
+                    if (ParamsMatch(ps, paramTypes)) return mi;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        private void PatchPostfix(MethodInfo target, MethodInfo postfix, int priority)
+        {
+            if (_harmony == null || target == null || postfix == null) return;
+            if (_miHarmonyPatchAny == null) return;
+
+            HarmonyMethod hmPost = new HarmonyMethod(postfix);
+            hmPost.priority = priority;
+
+            ParameterInfo[] ps = _miHarmonyPatchAny.GetParameters();
+            object[] args = new object[ps.Length];
+
+            args[0] = target;
+            if (args.Length >= 2) args[1] = null;   // prefix
+            if (args.Length >= 3) args[2] = hmPost; // postfix
+            for (int i = 3; i < args.Length; i++) args[i] = null; // transpiler / finalizer / etc
+
+            try { _miHarmonyPatchAny.Invoke(_harmony, args); }
+            catch (Exception e) { Logger.LogWarning("[PATCH] PatchPostfix invoke failed: " + e.Message); }
+        }
+
+        private void Patch_StudioScene_Load()
+        {
+            if (_miHarmonyPatchAny == null) return;
+        
+            try
+            {
+                // Studio.SceneInfo.Load(string, out Version) : bool
+                MethodInfo miLoad = AccessTools.Method("Studio.SceneInfo:Load",
+                    new Type[] { typeof(string), typeof(Version).MakeByRefType() }, null);
+        
+                if (miLoad == null)
+                {
+                    Logger.LogWarning("[PATCH] Studio.SceneInfo.Load not found.");
+                    return;
+                }
+        
+                MethodInfo post = typeof(RandomPngDropViaWM_BatchFemale).GetMethod(
+                    "SceneInfo_Load_Postfix",
+                    BindingFlags.Static | BindingFlags.NonPublic);
+        
+                if (post == null)
+                {
+                    Logger.LogWarning("[PATCH] SceneInfo_Load_Postfix not found.");
+                    return;
+                }
+        
+                PatchPostfix(miLoad, post, Priority.Last);
+                Logger.LogInfo("[PATCH] Patched Studio.SceneInfo.Load postfix.");
+            }
+            catch (Exception e)
+            {
+                Logger.LogWarning("[PATCH] Patch_StudioScene_Load failed: " + e.Message);
+            }
+        }
+
+    
+
+        private static void MW_OnCharacterReplace_Postfix()
+        {
+            if (_inst == null) return;
+            if (!_inst._patchTriggers.Value) return;
+            if (!_inst._autoOnCharacterReplace.Value) return;
+        
+            // 如果当前正在处理脚本引发的加载，或者正在执行协程，直接跳过
+            if (_isInternalTrigger || _inst._busy) 
+            {
+                // Logger.LogInfo("[AUTO] Internal trigger or busy, skipping to prevent recursion.");
+                return;
+            }
+        
+            // 触发自动执行，理由设为 OnCharaLoad
+            _inst.TriggerAutoRun("OnCharaLoad (Limited)");
+        }
+
+        private static void SceneInfo_Load_Postfix(string _path, ref Version _dataVersion, bool __result)
+        {
+            try
+            {
+                if (!__result) return;
+                if (_inst == null) return;
+                if (!_inst._patchTriggers.Value) return;
+                if (!_inst._autoOnSceneLoad.Value) return;
+
+                _inst.TriggerAutoRun("SceneInfo.Load");
+            }
+            catch { }
+        }
+
+        private void TriggerAutoRun(string reason)
+        {
+            if (!_enable.Value || _busy || _isInternalTrigger) return;
+        
+            int frames = Mathf.Clamp(_autoDelayFrames.Value, 0, 600);
+            
+            string dir;
+            if (reason == "SceneInfo.Load")
+            {
+                // 场景加载时使用的目录（例如使用 F4 目录）
+                dir = (_pngDir_F4.Value == null) ? "" : _pngDir_F4.Value.Trim();
+                Logger.LogInfo("[AUTO] Scene Load detected. Target: PngDir_F4");
+            }
+            else
+            {
+                // 角色更换/OnCharaLoad 时使用的目录（按你要求改为 Ctrl+F4 目录）
+                dir = (_pngDir_CtrlF4.Value == null) ? "" : _pngDir_CtrlF4.Value.Trim();
+                Logger.LogInfo("[AUTO] Character Load detected. Target: PngDir_CtrlF4");
+            }
+            if (string.IsNullOrEmpty(dir)) return;
+        
+            StartCoroutine(Co_DelayedAutoRun(frames, dir, reason));
+        }
+        private IEnumerator Co_DelayedAutoRun(int frames, string dir, string reason)
+        {
+            _busy = true;
+            _isInternalTrigger = true; // 开启拦截锁
+            
+            try
+            {
+                for (int i = 0; i < frames; i++) yield return null;
+
+                if (!_enable.Value) yield break;
+
+                Logger.LogInfo("[AUTO] {reason} triggered. Using Ctrl+F4 Path: "+dir);
+                
+                // 执行随机 Drop 逻辑
+                yield return StartCoroutine(Co_RunFromDir(dir, "AUTO_ONCE"));
+                
+                // 执行完后额外等待一小段时间，确保 Unity 处理完所有的消息队列
+                for (int i = 0; i < 10; i++) yield return null;
+            }
+            finally
+            {
+                _busy = false;
+                _isInternalTrigger = false; // 解锁，允许下一次手动或合法的自动触发
+                Logger.LogInfo("[AUTO] Lock released.");
+            }
+        }
+
 
         // ===== selection control (what DragAndDrop.StudioHandler uses) =====
 
